@@ -1,0 +1,7 @@
+node_modules/
+public
+.prettierrc
+package-lock.json
+package.json
+DOCS.md
+docs/
