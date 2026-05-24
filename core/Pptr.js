@@ -246,7 +246,7 @@ class Pptr {
 
 	async clickText(text, tag = '*') {
 		this.log.info(`clickText "${text}" <${tag}>`)
-		const el = await this.page.$x(`//${tag}[contains(text(), "${text}")]`)
+		const el = await this.page.$$(`::-p-xpath(//${tag}[contains(., "${text}")])`)
 		if (!el.length) throw new Error(`Element with text "${text}" not found`)
 		return el[0].click()
 	}
