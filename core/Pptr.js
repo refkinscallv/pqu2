@@ -69,6 +69,12 @@ class Pptr {
 		this.page = null
 		this.log = new Logger({ enabled: log, logFile })
 		this._networkLog = []
+		// Posisi kursor virtual yang dilacak agar gerakan terasa kontinu/manusiawi
+		this._mouse = { x: 0, y: 0 }
+		// Guard agar setRequestInterception + listener tidak terpasang ganda
+		this._interceptionReady = false
+		this._launchOptions = {}
+		this._devtoolsOpen = false
 	}
 
 	// ─── Launch ──────────────────────────────────────────────────────────────
@@ -89,8 +95,12 @@ class Pptr {
 			defaultViewport: { width: 1366, height: 768 },
 		}
 
-		this.log.info(`Launching browser (headless: ${options.headless ?? true})`)
-		this.browser = await puppeteer.launch({ ...defaults, ...options })
+		const launchOptions = { ...defaults, ...options }
+		this._launchOptions = launchOptions
+		this._devtoolsOpen = launchOptions.devtools === true
+
+		this.log.info(`Launching browser (headless: ${launchOptions.headless ?? true})`)
+		this.browser = await puppeteer.launch(launchOptions)
 		this.page = await this.browser.newPage()
 		await this._setupPage(this.page)
 		this.log.success('Browser ready')
@@ -101,6 +111,9 @@ class Pptr {
 		await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' })
 		page.setDefaultTimeout(30000)
 		page.setDefaultNavigationTimeout(30000)
+		// Setiap page baru → interception belum aktif & kursor di pojok kiri-atas
+		this._interceptionReady = false
+		this._mouse = { x: 0, y: 0 }
 	}
 
 	// ─── Navigation ──────────────────────────────────────────────────────────
@@ -149,6 +162,14 @@ class Pptr {
 	}
 
 	async waitForUrl(urlOrPredicate, timeout = 30000) {
+		if (typeof urlOrPredicate === 'function') {
+			const start = Date.now()
+			while (Date.now() - start < timeout) {
+				if (urlOrPredicate(this.page.url())) return this.page.url()
+				await this.sleep(200)
+			}
+			throw new Error(`waitForUrl: timeout ${timeout}ms (predicate)`)
+		}
 		return this.page.waitForFunction(
 			(expected) => window.location.href.includes(expected),
 			{ timeout },
@@ -241,14 +262,24 @@ class Pptr {
 
 	async clickAt(x, y) {
 		this.log.info(`clickAt (${x}, ${y})`)
+		this._mouse = { x, y }
 		return this.page.mouse.click(x, y)
 	}
 
 	async clickText(text, tag = '*') {
 		this.log.info(`clickText "${text}" <${tag}>`)
-		const el = await this.page.$$(`::-p-xpath(//${tag}[contains(., "${text}")])`)
+		const literal = this._xpathLiteral(text)
+		const el = await this.page.$$(`::-p-xpath(//${tag}[contains(., ${literal})])`)
 		if (!el.length) throw new Error(`Element with text "${text}" not found`)
 		return el[0].click()
+	}
+
+	// Bangun XPath string literal yang aman walau teks mengandung kutip ' atau "
+	_xpathLiteral(value) {
+		if (!value.includes('"')) return `"${value}"`
+		if (!value.includes("'")) return `'${value}'`
+		// Mengandung keduanya → pecah dengan concat()
+		return 'concat(' + value.split('"').map((part) => `"${part}"`).join(', \'"\', ') + ')'
 	}
 
 	async type(selector, text, { clear = true, delay = 50 } = {}) {
@@ -370,6 +401,7 @@ class Pptr {
 	}
 
 	async mouseMove(x, y) {
+		this._mouse = { x, y }
 		return this.page.mouse.move(x, y)
 	}
 
@@ -515,16 +547,30 @@ class Pptr {
 		if (headers) await this.page.setExtraHTTPHeaders(headers)
 	}
 
-	async intercept(urlPattern, handler) {
+	// Aktifkan request interception sekali saja; cegah listener/continue ganda
+	async _enableInterception() {
+		if (this._interceptionReady) return
 		await this.page.setRequestInterception(true)
+		this._interceptionReady = true
+	}
+
+	async intercept(urlPattern, handler) {
+		await this._enableInterception()
 		this.page.on('request', (req) => {
+			// Hormati jika request sudah ditangani listener lain
+			if (req.interceptResolutionState && req.interceptResolutionState().action !== 'continue') {
+				return
+			}
 			req.url().includes(urlPattern) ? handler(req) : req.continue()
 		})
 	}
 
 	async blockResources(types = ['image', 'stylesheet', 'font', 'media']) {
-		await this.page.setRequestInterception(true)
+		await this._enableInterception()
 		this.page.on('request', (req) => {
+			if (req.interceptResolutionState && req.interceptResolutionState().action !== 'continue') {
+				return
+			}
 			types.includes(req.resourceType()) ? req.abort() : req.continue()
 		})
 	}
@@ -862,6 +908,196 @@ class Pptr {
 				}),
 			fields
 		)
+	}
+
+	// ─── Human-like Behavior ───────────────────────────────────────────────────
+
+	_rand(min, max) {
+		return Math.random() * (max - min) + min
+	}
+
+	_randInt(min, max) {
+		return Math.floor(this._rand(min, max + 1))
+	}
+
+	// Titik acak di dalam bounding box (cenderung ke tengah, hindari tepi)
+	_pointInBox(box, { padding = 0.25 } = {}) {
+		const px = box.width * padding
+		const py = box.height * padding
+		return {
+			x: box.x + this._rand(px, box.width - px),
+			y: box.y + this._rand(py, box.height - py),
+		}
+	}
+
+	// Gerakkan kursor mengikuti kurva Bézier kubik dengan langkah + jitter kecil
+	async humanMoveTo(x, y, { steps, jitter = 1.2 } = {}) {
+		const from = { ...this._mouse }
+		const dist = Math.hypot(x - from.x, y - from.y)
+		const n = steps ?? Math.max(12, Math.min(40, Math.round(dist / 12)))
+
+		// Dua control point acak agar lintasan melengkung, bukan garis lurus
+		const c1 = {
+			x: from.x + (x - from.x) * this._rand(0.2, 0.4) + this._rand(-dist, dist) * 0.12,
+			y: from.y + (y - from.y) * this._rand(0.2, 0.4) + this._rand(-dist, dist) * 0.12,
+		}
+		const c2 = {
+			x: from.x + (x - from.x) * this._rand(0.6, 0.8) + this._rand(-dist, dist) * 0.12,
+			y: from.y + (y - from.y) * this._rand(0.6, 0.8) + this._rand(-dist, dist) * 0.12,
+		}
+
+		for (let i = 1; i <= n; i++) {
+			const t = i / n
+			const u = 1 - t
+			// Posisi pada kurva Bézier kubik
+			let bx =
+				u * u * u * from.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * x
+			let by =
+				u * u * u * from.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * y
+
+			if (i < n) {
+				bx += this._rand(-jitter, jitter)
+				by += this._rand(-jitter, jitter)
+			}
+
+			await this.page.mouse.move(bx, by)
+			this._mouse = { x: bx, y: by }
+			// Easing: lebih lambat di awal & akhir gerakan
+			const ease = 1 - Math.abs(0.5 - t) * 2
+			await this.sleep(this._rand(4, 10) + ease * this._rand(2, 6))
+		}
+
+		this._mouse = { x, y }
+	}
+
+	// Gerakkan kursor ke arah elemen (selector) secara manusiawi, lalu hover
+	async humanMoveToTarget(selector, options = {}) {
+		this.log.info(`humanMove → "${selector}"`)
+		await this.waitFor(selector)
+		await this.scrollTo(selector)
+		await this.sleep(this._rand(120, 300))
+		const box = await this.boundingBox(selector)
+		if (!box) throw new Error(`humanMoveToTarget: elemen "${selector}" tidak punya bounding box`)
+		const p = this._pointInBox(box, options)
+		await this.humanMoveTo(p.x, p.y, options)
+		return p
+	}
+
+	// Klik manusiawi: bergerak ke target, jeda kecil, tekan-lepas dengan delay
+	async humanClick(selector, options = {}) {
+		this.log.info(`humanClick "${selector}"`)
+		await this.humanMoveToTarget(selector, options)
+		await this.sleep(this._rand(40, 140))
+		await this.page.mouse.down()
+		await this.sleep(this._rand(40, 110))
+		await this.page.mouse.up()
+	}
+
+	// Hover manusiawi (gerak melengkung + diam sebentar)
+	async humanHover(selector, options = {}) {
+		await this.humanMoveToTarget(selector, options)
+		await this.sleep(this._rand(150, 400))
+	}
+
+	// Ketik dengan ritme manusiawi: delay variatif, jeda lebih lama setelah spasi/tanda baca
+	async humanType(selector, text, { clear = false, mistakes = 0 } = {}) {
+		this.log.info(`humanType "${selector}" → "${text}"`)
+		await this.humanClick(selector)
+		if (clear) {
+			await this.combo('Control', 'a')
+			await this.press('Backspace')
+		}
+
+		for (const ch of text) {
+			// Sesekali salah ketik lalu hapus (jika diaktifkan)
+			if (mistakes > 0 && Math.random() < mistakes) {
+				const wrong = String.fromCharCode(this._randInt(97, 122))
+				await this.page.keyboard.type(wrong, { delay: this._rand(40, 120) })
+				await this.sleep(this._rand(120, 300))
+				await this.press('Backspace')
+				await this.sleep(this._rand(80, 200))
+			}
+
+			await this.page.keyboard.type(ch, { delay: this._rand(45, 140) })
+
+			if (/[.,!?]/.test(ch)) await this.sleep(this._rand(180, 420))
+			else if (ch === ' ' && Math.random() < 0.3) await this.sleep(this._rand(80, 220))
+		}
+	}
+
+	// Scroll bertahap dalam langkah kecil + jeda, meniru roda mouse manusia
+	async humanScroll(distance = 800, { steps } = {}) {
+		this.log.info(`humanScroll ${distance}px`)
+		const dir = distance < 0 ? -1 : 1
+		const total = Math.abs(distance)
+		const n = steps ?? this._randInt(6, 12)
+		let scrolled = 0
+
+		for (let i = 0; i < n; i++) {
+			const remaining = total - scrolled
+			if (remaining <= 0) break
+			const step = Math.min(remaining, this._rand(total / n / 1.6, total / n / 0.7))
+			await this.page.mouse.wheel({ deltaY: step * dir })
+			scrolled += step
+			await this.sleep(this._rand(60, 220))
+		}
+	}
+
+	// Jeda "berpikir" acak ala manusia
+	async humanIdle(min = 400, max = 1500) {
+		const ms = this._randInt(min, max)
+		this.log.debug(`humanIdle ${ms}ms`)
+		await this.sleep(ms)
+	}
+
+	// Gerakkan kursor secara acak ke beberapa titik di viewport (no-op klik)
+	async humanWander(times = 3) {
+		const vp = this.page.viewport() ?? { width: 1366, height: 768 }
+		for (let i = 0; i < times; i++) {
+			await this.humanMoveTo(
+				this._rand(vp.width * 0.1, vp.width * 0.9),
+				this._rand(vp.height * 0.1, vp.height * 0.9)
+			)
+			await this.sleep(this._rand(120, 400))
+		}
+	}
+
+	// Buka DevTools. Andal hanya bila browser headful & dilaunch dgn devtools:true,
+	// atau via CDP Inspector (best-effort). Mengembalikan true bila berhasil dibuka.
+	async openDevTools() {
+		if (this._devtoolsOpen) {
+			this.log.debug('DevTools sudah terbuka')
+			return true
+		}
+		if (this._launchOptions.headless ?? true) {
+			this.log.warn('openDevTools diabaikan: browser berjalan headless. Launch dengan { headless: false }')
+			return false
+		}
+		try {
+			const client = await this.page.target().createCDPSession()
+			// Inspector.enable + buka window devtools untuk target aktif (best-effort)
+			await client.send('Inspector.enable').catch(() => {})
+			await client.send('Page.enable').catch(() => {})
+			// Trik membuka jendela DevTools melalui protokol internal Chromium
+			const browserClient = await this.browser.target().createCDPSession()
+			const { targetInfos } = await browserClient.send('Target.getTargets')
+			const pageTarget = targetInfos.find(
+				(t) => t.type === 'page' && t.url === this.page.url()
+			)
+			if (pageTarget) {
+				await browserClient
+					.send('Target.createTarget', {
+						url: `devtools://devtools/bundled/inspector.html?ws=${pageTarget.targetId}`,
+					})
+					.catch(() => {})
+			}
+			this._devtoolsOpen = true
+			this.log.success('DevTools dibuka')
+			return true
+		} catch (err) {
+			this.log.warn(`openDevTools gagal: ${err.message}. Saran: launch dengan { headless: false, devtools: true }`)
+			return false
+		}
 	}
 
 	// ─── Close ───────────────────────────────────────────────────────────────
